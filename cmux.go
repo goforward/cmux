@@ -115,6 +115,7 @@ type cMux struct {
 	bufLen      int
 	errh        ErrorHandler
 	sls         []matchersListener
+	slsMutex    sync.RWMutex
 	readTimeout time.Duration
 	donec       chan struct{}
 	mu          sync.Mutex
@@ -142,7 +143,9 @@ func (m *cMux) MatchWithWriters(matchers ...MatchWriter) net.Listener {
 		connc:    make(chan net.Conn, m.bufLen),
 		donec:    make(chan struct{}),
 	}
+	m.slsMutex.Lock()
 	m.sls = append(m.sls, matchersListener{ss: matchers, l: ml})
+	m.slsMutex.Unlock()
 	return ml
 }
 
@@ -157,6 +160,7 @@ func (m *cMux) Serve() error {
 		m.closeDoneChans()
 		wg.Wait()
 
+		m.slsMutex.RLock()
 		for _, sl := range m.sls {
 			close(sl.l.connc)
 			// Drain the connections enqueued for the listener.
@@ -164,6 +168,7 @@ func (m *cMux) Serve() error {
 				_ = c.Close()
 			}
 		}
+		m.slsMutex.RUnlock()
 	}()
 
 	for {
@@ -187,6 +192,7 @@ func (m *cMux) serve(c net.Conn, donec <-chan struct{}, wg *sync.WaitGroup) {
 	if m.readTimeout > noTimeout {
 		_ = c.SetReadDeadline(time.Now().Add(m.readTimeout))
 	}
+	m.slsMutex.RLock()
 	for _, sl := range m.sls {
 		for _, s := range sl.ss {
 			matched := s(muc.Conn, muc.startSniffing())
@@ -204,6 +210,7 @@ func (m *cMux) serve(c net.Conn, donec <-chan struct{}, wg *sync.WaitGroup) {
 			}
 		}
 	}
+	m.slsMutex.RUnlock()
 
 	_ = c.Close()
 	err := ErrNotMatched{c: c}
@@ -226,6 +233,7 @@ func (m *cMux) closeDoneChans() {
 	default:
 		close(m.donec)
 	}
+	m.slsMutex.RLock()
 	for _, sl := range m.sls {
 		select {
 		case <-sl.l.donec:
@@ -234,6 +242,7 @@ func (m *cMux) closeDoneChans() {
 			close(sl.l.donec)
 		}
 	}
+	m.slsMutex.RUnlock()
 }
 
 func (m *cMux) HandleError(h ErrorHandler) {
